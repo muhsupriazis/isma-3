@@ -1,18 +1,22 @@
-from flask import Flask, request, render_template, redirect, url_for, session, flash
-import cv2
+from flask import Flask, request, render_template, redirect, url_for, session, flash, jsonify
+import random
+from datetime import datetime
+from werkzeug.utils import secure_filename
 import os
 import numpy as np
 import joblib
-from skimage.feature import graycomatrix, graycoprops
-from datetime import datetime
-import random
-from werkzeug.utils import secure_filename
+import cv2
+import pandas as pd
+from skimage.feature import graycomatrix, graycoprops # The function name is 'graycomatrix', not 'greycomatrix'
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
 
 # Inisialisasi aplikasi Flask
 app = Flask(__name__)
-# Konfigurasi aplikasi
-app = Flask(__name__)
+
 app.config['UPLOAD_FOLDER'] = './static/uploads'  # Lokasi penyimpanan file
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}  # Format file yang diizinkan
 # Kamus pengguna: username sebagai kunci, dan tuple (password, role) sebagai nilai
@@ -23,27 +27,48 @@ users = {
 }
 app.secret_key = 'supersecretkey'
 
-# Muat model dan skaler
 model = joblib.load('models/knn_model.pkl')
 scaler = joblib.load('models/scaler.pkl')
+le = joblib.load('models/label_encoder.pkl')
 
 # Fungsi untuk memeriksa ekstensi file
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 
-# Fungsi untuk ekstraksi fitur menggunakan GLCM (sama seperti sebelumnya)
 def extract_glcm_features(image):
-    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    distances = [1]
-    angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
-    glcm = graycomatrix(gray_image, distances, angles, 256, symmetric=True, normed=True)
-    contrast = graycoprops(glcm, 'contrast').flatten()
-    dissimilarity = graycoprops(glcm, 'dissimilarity').flatten()
-    homogeneity = graycoprops(glcm, 'homogeneity').flatten()
-    energy = graycoprops(glcm, 'energy').flatten()
-    correlation = graycoprops(glcm, 'correlation').flatten()
-    return np.hstack([contrast, dissimilarity, homogeneity, energy, correlation])
+    glcm = graycomatrix(image, distances=[5], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256)
+    features = [
+        graycoprops(glcm, 'contrast')[0, 0],
+        graycoprops(glcm, 'energy')[0, 0],
+        graycoprops(glcm, 'homogeneity')[0, 0],
+        graycoprops(glcm, 'correlation')[0, 0],
+    ]
+    return features
+
+# Preprocessing
+def preprocess_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (128, 128))  # Resize to 128x128
+    return resized
+
+# Extract HSV Features
+def extract_hsv_features(image):
+    hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mean_hsv = np.mean(hsv_img, axis=(0, 1))
+    std_hsv = np.std(hsv_img, axis=(0, 1))
+    return list(mean_hsv) + list(std_hsv)
+
+# Feature Extraction Pipeline
+def extract_features_with_hsv(images):
+    features = []
+    for img in images:
+        gray_img = preprocess_image(img)
+        glcm_features = extract_glcm_features(gray_img)
+        hsv_features = extract_hsv_features(img)
+        combined_features = glcm_features + hsv_features
+        features.append(combined_features)
+    return np.array(features)
 
 # Rute untuk halaman utama
 @app.route('/')
@@ -90,43 +115,58 @@ def logout():
     session.pop('role', None)
     return redirect(url_for('home'))
 
-# Rute untuk memproses gambar dan melakukan prediksi
+
+# Define route for prediction
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files:
-        return redirect(request.url)
+        return jsonify({"error": "No file part"})
     
     file = request.files['file']
     if file.filename == '':
-        return redirect(request.url)
+        return jsonify({"error": "No selected file"})
+    
+    if file and allowed_file(file.filename):
+        # Secure the filename and save the file
+        filename = secure_filename(file.filename)
+        file_path = os.path.join('static/uploads', filename)
+        file.save(file_path)
 
-    if file:
-        # Baca gambar dari input pengguna
-        image = np.fromstring(file.read(), np.uint8)
-        image = cv2.imdecode(image, cv2.IMREAD_COLOR)
-        
-        # Ekstraksi fitur dari gambar
-        features_glcm = extract_glcm_features(image)
-        features = scaler.transform([features_glcm])
-        
-        # Prediksi menggunakan model
-        prediction = model.predict(features)[0]
+        # Process the image and predict
+        img = cv2.imread(file_path)
+        if img is None:
+            return jsonify({"error": "Image not found!"})
 
-        # Simpan gambar yang diunggah
-        upload_folder = 'static/uploads'  # Pastikan folder ini ada
-        if not os.path.exists(upload_folder):
-            os.makedirs(upload_folder)
-        file_path = os.path.join(upload_folder, file.filename)
-        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)  # OpenCV menggunakan BGR
-        cv2.imwrite(file_path, image_bgr)
-        
-        # Dekode label (misalnya, 0 -> "bad", 1 -> "good")
-        label = "Berkualitas" if prediction == 1 else "Tidak Berkualitas"
+        # Preprocess the image (resize and convert to grayscale)
+        gray_img = preprocess_image(img)
+
+        # Extract features (GLCM + HSV)
+        glcm_features = extract_glcm_features(gray_img)
+        hsv_features = extract_hsv_features(img)
+        combined_features = glcm_features + hsv_features
+
+        # Normalize the features using the same scaler
+        combined_features = np.array(combined_features).reshape(1, -1)  # Make sure it's 2D for the model
+        combined_features = scaler.transform(combined_features)
+
         kode_random = random.randint(00, 99)  # 6-digit random code
         tanggal_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
-        
-        return render_template('predict.html', features=features_glcm, label=label, image_file=file.filename, kode_random=kode_random, tanggal_sekarang=tanggal_sekarang)
-    
+        # Predict using the trained model
+        predicted_label = model.predict(combined_features)
+        print(predicted_label)
+        # Decode the label
+        predicted_class = le.inverse_transform(predicted_label)
+
+        # Percabangan
+        if predicted_class[0] == "bad":
+            hasil = "Tidak Berkualitas"
+        elif predicted_class[0] == "good":
+            hasil = "Berkualitas"
+        else:
+            hasil = "Tidak bisa diidentifikasi"
+
+        return render_template('predict.html', features=glcm_features, label=hasil, image_file=filename, kode_random=kode_random, tanggal_sekarang=tanggal_sekarang)
+
     return render_template('dashboard.html', label="Error")
 
 # Fungsi untuk memeriksa format file
